@@ -758,10 +758,11 @@ class KubernetesLock(BaseLock):
             key = '%s-%s' % (self.namespace, self.lock_name)
         else:
             key = self.lock_name
+        # TODO: reject invalid rather than mangle
         return key.replace('_', '-')
 
     def _get_lease_expiry_time(self, lease: kubernetes.client.V1Lease) -> datetime:
-        # Determine whether the Lease has exired.
+        # Determine whether the Lease has expired.
         if lease.spec.renew_time is not None and lease.spec.lease_duration_seconds is not None:
             return lease.spec.renew_time + datetime.timedelta(seconds=lease.spec.lease_duration_seconds)
         elif lease.spec.lease_duration_seconds is None:
@@ -773,12 +774,16 @@ class KubernetesLock(BaseLock):
         owner = self._owner or str(uuid.uuid4())
 
         try:
+            # Comment here about safety requirements from updating the instance ("resource version")
             lease = self.client.read_namespaced_lease(
-                name=name, namespace=self.k8s_namespace
+                name=name,
+                namespace=self.k8s_namespace,
             )
         except kubernetes.client.exceptions.ApiException as exc:
             if exc.reason == 'Not Found':
                 now = datetime.datetime.now(tz=datetime.timezone.utc)
+                # TODO: maybe extract creation logic to helper? Or comment for clarity that this is the "happy path"
+                # TODO: what if this request conflicts? (perhaps should catch and return False)
                 lease = self.client.create_namespaced_lease(
                     namespace=self.k8s_namespace,
                     body=kubernetes.client.V1Lease(
@@ -795,24 +800,35 @@ class KubernetesLock(BaseLock):
                 )
                 self._owner = owner
                 return True
+
             raise LockException('Could not read or create Lock.') from exc
 
+        # TODO: hoist "now" construction? or `self._now()`?
         now = datetime.datetime.now(tz=datetime.timezone.utc)
-        if owner == lease.spec.holder_identity:
-            # Same owner renew lease.
-            lease.spec.renew_time = now
-            lease.spec.lease_duration_seconds = self.expire
-        elif now < self._get_lease_expiry_time(lease):
-            # Lease has not expired.
-            return False
+        has_expired = self._has_expired(lease, now=now)
+        if owner != lease.spec.holder_identity:
+            if not has_expired:
+                # Someone else has the lock
+                return False
+
+            else:
+                # Lock available
+                # .. assignments to acquire lock
+                lease.spec.holder_identity = owner
+                lease.spec.acquire_time = now  # shouldn't be updating the acquire time if
+
+        elif has_expired:
+            # Lock available
+            # .. assignments to acquire lock
+            lease.spec.holder_identity = owner
+            lease.spec.acquire_time = now  # shouldn't be updating the acquire time if
 
         # Different owner and lease has expired so acquire lease.
-        lease.spec.holder_identity = owner
-        lease.spec.acquire_time = now
         lease.spec.renew_time = now
         lease.spec.lease_duration_seconds = self.expire
 
         try:
+            # Comment about resource version here noting that races will cause exceptions
             lease = self.client.replace_namespaced_lease(
                 name=name,
                 namespace=self.k8s_namespace,
@@ -821,7 +837,7 @@ class KubernetesLock(BaseLock):
         except kubernetes.client.exceptions.ApiException as exc:
             if exc.reason == 'Conflict':
                 return False
-            raise Lock('Failed to update Lock.') from exc
+            raise LockException('Failed to update Lock.') from exc
         self._owner = owner
         return True
 
@@ -835,10 +851,12 @@ class KubernetesLock(BaseLock):
                 name=name,
                 namespace=self.k8s_namespace,
             )
+            # Maaaybe call out that we don't need to worry about whether it's expired?
             if self._owner == lease.spec.holder_identity:
                 self.client.delete_namespaced_lease(
                     name=name,
                     namespace=self.k8s_namespace,
+                    # Maaaybe comment why this isn't just `body=lease`?
                     body=kubernetes.client.V1DeleteOptions(
                         preconditions=kubernetes.client.V1Preconditions(
                             resource_version=lease.metadata.resource_version
